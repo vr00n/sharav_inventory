@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <title>Sharav Inventory</title>
-  <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+  <!-- Quagga2 loaded dynamically as fallback only -->
   <style>
     :root {
       --green-dark: #1b5e20;
@@ -169,24 +169,96 @@
       position: relative;
       background: #000;
       flex-shrink: 0;
-      max-height: 38vh;
+      height: 38vh;
       overflow: hidden;
     }
     #reader {
       width: 100%;
+      height: 100%;
     }
-    /* Override html5-qrcode UI */
-    #reader video { width: 100% !important; height: auto !important; display: block; }
-    #reader img { display: none !important; }
+    #reader video {
+      width: 100% !important;
+      height: 100% !important;
+      object-fit: cover;
+      display: block;
+    }
+    /* Quagga2 injects its own canvas — keep it in-bounds */
+    #reader canvas { position: absolute !important; top: 0; left: 0; width: 100% !important; height: 100% !important; }
 
-    .scan-overlay-text {
+    /* ── SCAN OVERLAY ─────────────────────────────────── */
+    #scan-overlay {
       position: absolute;
-      bottom: 8px;
-      left: 0; right: 0;
-      text-align: center;
-      color: rgba(255,255,255,0.85);
-      font-size: 0.78rem;
+      inset: 0;
       pointer-events: none;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+    }
+
+    /* transparent edges, bright centre window */
+    .scan-window {
+      position: relative;
+      width: 85%;
+      height: 56px;
+      border: 2px solid rgba(255,255,255,0.55);
+      border-radius: 6px;
+      overflow: visible;
+    }
+    /* corner brackets */
+    .scan-window::before, .scan-window::after,
+    .sw-bl, .sw-br {
+      content: '';
+      position: absolute;
+      width: 18px; height: 18px;
+      border-color: #fff;
+      border-style: solid;
+    }
+    .scan-window::before { top:-2px; left:-2px; border-width: 3px 0 0 3px; border-radius: 4px 0 0 0; }
+    .scan-window::after  { top:-2px; right:-2px; border-width: 3px 3px 0 0; border-radius: 0 4px 0 0; }
+    .sw-bl { bottom:-2px; left:-2px; border-width: 0 0 3px 3px; border-radius: 0 0 0 4px; }
+    .sw-br { bottom:-2px; right:-2px; border-width: 0 3px 3px 0; border-radius: 0 0 4px 0; }
+
+    /* laser line */
+    .laser {
+      position: absolute;
+      left: 0; right: 0;
+      height: 2px;
+      background: linear-gradient(90deg, transparent 0%, #4cff78 20%, #4cff78 80%, transparent 100%);
+      top: 50%;
+      transform: translateY(-50%);
+      animation: laser-sweep 1.6s ease-in-out infinite;
+      box-shadow: 0 0 6px 2px rgba(76,255,120,0.55);
+    }
+    @keyframes laser-sweep {
+      0%   { top: 8%;  opacity: 0.6; }
+      50%  { top: 92%; opacity: 1;   }
+      100% { top: 8%;  opacity: 0.6; }
+    }
+
+    /* lock-progress pill */
+    #lock-bar-wrap {
+      margin-top: 10px;
+      width: 85%;
+      background: rgba(255,255,255,0.18);
+      border-radius: 20px;
+      height: 6px;
+      overflow: hidden;
+    }
+    #lock-bar {
+      height: 100%;
+      width: 0%;
+      background: #4cff78;
+      border-radius: 20px;
+      transition: width 0.12s ease, background 0.2s;
+    }
+    #lock-bar.locked { background: #ffffff; }
+
+    #lock-label {
+      margin-top: 6px;
+      font-size: 0.72rem;
+      color: rgba(255,255,255,0.75);
+      letter-spacing: 0.3px;
     }
 
     /* Manual entry bar */
@@ -451,7 +523,14 @@
 
   <div id="reader-wrapper">
     <div id="reader"></div>
-    <div class="scan-overlay-text">Point camera at barcode</div>
+    <div id="scan-overlay">
+      <div class="scan-window">
+        <div class="sw-bl"></div><div class="sw-br"></div>
+        <div class="laser"></div>
+      </div>
+      <div id="lock-bar-wrap"><div id="lock-bar"></div></div>
+      <div id="lock-label">Point camera at barcode</div>
+    </div>
   </div>
 
   <div class="manual-bar">
@@ -604,74 +683,198 @@ function goSetup() {
   showView('view-setup');
 }
 
-/* ── SCANNER ─────────────────────────────────────────── */
-function startScanner() {
-  if (scanner) {
-    scanner.resume().catch(() => {});
-    return;
+/* ── VOTE SYSTEM ─────────────────────────────────────── */
+// Collects raw reads into a rolling window. Only fires onConfirmedScan()
+// when the same value appears VOTE_NEEDED times out of VOTE_WINDOW frames,
+// which eliminates all one-off garbled / partial reads.
+const VOTE_WINDOW = 7;
+const VOTE_NEEDED = 5;
+const COOLDOWN_MS = 2200;
+
+let voteBuffer = [];
+let lastConfirmed = '';
+let lastConfirmedAt = 0;
+
+function castVote(raw) {
+  const code = raw.trim();
+  if (!code) return;
+
+  voteBuffer.push(code);
+  if (voteBuffer.length > VOTE_WINDOW) voteBuffer.shift();
+
+  // tally
+  const counts = {};
+  voteBuffer.forEach(c => counts[c] = (counts[c] || 0) + 1);
+
+  let winner = null, maxVotes = 0;
+  for (const [k, v] of Object.entries(counts)) {
+    if (v > maxVotes) { winner = k; maxVotes = v; }
   }
-  scanner = new Html5Qrcode('reader');
 
-  const config = {
-    fps: 15,
-    qrbox: { width: 260, height: 100 },
-    supportedScanTypes: [
-      Html5QrcodeScanType.SCAN_TYPE_CAMERA
-    ],
-    formatsToSupport: [
-      Html5QrcodeSupportedFormats.CODE_128,
-      Html5QrcodeSupportedFormats.CODE_39,
-      Html5QrcodeSupportedFormats.EAN_13,
-      Html5QrcodeSupportedFormats.EAN_8,
-      Html5QrcodeSupportedFormats.UPC_A,
-      Html5QrcodeSupportedFormats.UPC_E,
-      Html5QrcodeSupportedFormats.ITF,
-      Html5QrcodeSupportedFormats.QR_CODE,
-      Html5QrcodeSupportedFormats.PDF_417,
-      Html5QrcodeSupportedFormats.DATA_MATRIX,
-    ]
-  };
+  // progress UI
+  const pct = Math.min(100, Math.round((maxVotes / VOTE_NEEDED) * 100));
+  const bar  = document.getElementById('lock-bar');
+  const lbl  = document.getElementById('lock-label');
+  bar.style.width = pct + '%';
 
-  Html5Qrcode.getCameras().then(cameras => {
-    if (!cameras || cameras.length === 0) {
-      showToast('No camera found – use manual entry', 'error');
-      return;
+  if (maxVotes >= VOTE_NEEDED) {
+    bar.classList.add('locked');
+    lbl.textContent = 'Locked: ' + winner;
+    const now = Date.now();
+    if (winner !== lastConfirmed || (now - lastConfirmedAt) > COOLDOWN_MS) {
+      lastConfirmed   = winner;
+      lastConfirmedAt = now;
+      voteBuffer = [];
+      // Brief flash before resetting bar
+      setTimeout(() => {
+        bar.style.width = '0%';
+        bar.classList.remove('locked');
+        lbl.textContent = 'Point camera at barcode';
+      }, 500);
+      addScan(winner);
+    } else {
+      // same code within cooldown — just reset bar
+      setTimeout(() => {
+        voteBuffer = [];
+        bar.style.width = '0%';
+        bar.classList.remove('locked');
+        lbl.textContent = 'Point camera at barcode';
+      }, 600);
     }
-    // prefer back camera
-    const cam = cameras.find(c => /back|rear|environment/i.test(c.label)) || cameras[cameras.length - 1];
-    scanner.start(
-      { deviceId: { exact: cam.id } },
-      config,
-      onScanSuccess,
-      () => {}   // silence per-frame errors
-    ).catch(err => {
-      // fallback: any camera
-      scanner.start({ facingMode: 'environment' }, config, onScanSuccess, () => {}).catch(e2 => {
-        showToast('Camera access denied – use manual entry', 'error');
-      });
+  } else {
+    bar.classList.remove('locked');
+    lbl.textContent = maxVotes > 0 ? `Locking… (${maxVotes}/${VOTE_NEEDED})` : 'Point camera at barcode';
+  }
+}
+
+function resetVotes() {
+  voteBuffer = [];
+  const bar = document.getElementById('lock-bar');
+  if (bar) { bar.style.width = '0%'; bar.classList.remove('locked'); }
+  const lbl = document.getElementById('lock-label');
+  if (lbl) lbl.textContent = 'Point camera at barcode';
+}
+
+/* ── SCANNER ─────────────────────────────────────────── */
+let activeStream   = null;   // MediaStream (native path)
+let rafId          = null;   // requestAnimationFrame handle
+let quaggaRunning  = false;
+
+async function startScanner() {
+  resetVotes();
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: { ideal: 'environment' },
+        width:  { ideal: 1920 },
+        height: { ideal: 1080 },
+        advanced: [{ focusMode: 'continuous' }]
+      }
     });
-  }).catch(() => {
-    showToast('Camera permission denied', 'error');
+    activeStream = stream;
+
+    if ('BarcodeDetector' in window) {
+      await _startNative(stream);
+    } else {
+      await _startQuagga(stream);
+    }
+  } catch (err) {
+    if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+      showToast('Camera permission denied – use manual entry', 'error');
+    } else {
+      showToast('Camera unavailable – use manual entry', 'error');
+    }
+  }
+}
+
+/* ── Native BarcodeDetector path ────────────────────── */
+async function _startNative(stream) {
+  const supported = await BarcodeDetector.getSupportedFormats().catch(() => []);
+  const want = ['code_128','code_39','ean_13','ean_8','upc_a','upc_e','itf','pdf417','data_matrix','qr_code','aztec'];
+  const formats = want.filter(f => supported.length === 0 || supported.includes(f));
+  const detector = new BarcodeDetector({ formats: formats.length ? formats : undefined });
+
+  const reader = document.getElementById('reader');
+  reader.innerHTML = '';
+  const video = document.createElement('video');
+  video.autoplay = true; video.playsInline = true; video.muted = true;
+  video.style.cssText = 'width:100%;height:100%;object-fit:cover;display:block;';
+  reader.appendChild(video);
+  video.srcObject = stream;
+  await video.play().catch(() => {});
+
+  async function loop() {
+    if (!activeStream) return;
+    try {
+      const results = await detector.detect(video);
+      if (results.length > 0) castVote(results[0].rawValue);
+    } catch (_) {}
+    rafId = requestAnimationFrame(loop);
+  }
+  rafId = requestAnimationFrame(loop);
+}
+
+/* ── Quagga2 fallback path ──────────────────────────── */
+async function _startQuagga(stream) {
+  // Stop the getUserMedia stream — Quagga manages its own
+  stream.getTracks().forEach(t => t.stop());
+  activeStream = null;
+
+  await _loadQuagga();
+
+  const reader = document.getElementById('reader');
+  reader.innerHTML = '';
+
+  await new Promise((resolve, reject) => {
+    Quagga.init({
+      inputStream: {
+        type: 'LiveStream',
+        target: reader,
+        constraints: {
+          facingMode: 'environment',
+          width:  { ideal: 1280 },
+          height: { ideal: 720 }
+        }
+      },
+      decoder: {
+        readers: [
+          'code_128_reader', 'code_39_reader',
+          'ean_reader', 'ean_8_reader',
+          'upc_reader', 'upc_e_reader', 'itf_reader'
+        ],
+        multiple: false
+      },
+      locate: true,
+      frequency: 12
+    }, err => err ? reject(err) : resolve());
+  });
+
+  Quagga.start();
+  quaggaRunning = true;
+
+  Quagga.onDetected(result => {
+    const code = result?.codeResult?.code;
+    if (code) castVote(code);
+  });
+}
+
+function _loadQuagga() {
+  if (window.Quagga) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/@ericblade/quagga2@1.8.4/dist/quagga.min.js';
+    s.onload = resolve;
+    s.onerror = reject;
+    document.head.appendChild(s);
   });
 }
 
 function stopScanner() {
-  if (scanner) {
-    scanner.stop().catch(() => {});
-    scanner = null;
-  }
-}
-
-let lastScanned = '';
-let lastScannedTime = 0;
-const DEBOUNCE_MS = 1800;   // avoid double-scan same code within 1.8 s
-
-function onScanSuccess(barcode) {
-  const now = Date.now();
-  if (barcode === lastScanned && (now - lastScannedTime) < DEBOUNCE_MS) return;
-  lastScanned     = barcode;
-  lastScannedTime = now;
-  addScan(barcode.trim());
+  if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+  if (activeStream) { activeStream.getTracks().forEach(t => t.stop()); activeStream = null; }
+  if (quaggaRunning) { try { Quagga.stop(); } catch(_) {} quaggaRunning = false; }
+  resetVotes();
+  document.getElementById('reader').innerHTML = '';
 }
 
 /* ── SCAN LOGIC ─────────────────────────────────────── */
