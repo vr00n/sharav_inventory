@@ -4,7 +4,20 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <title>Sharav Inventory</title>
-  <!-- Quagga2 loaded dynamically as fallback only -->
+  <!--
+    barcode-detector polyfill: uses native BarcodeDetector where available
+    (Chrome on Android, Safari 17.4+) and falls back to ZXing on iOS Safari.
+    Loaded as an ES module so it patches window.BarcodeDetector automatically.
+  -->
+  <script type="module">
+    try {
+      await import('https://esm.sh/barcode-detector@3/side-effects');
+    } catch (e) {
+      // esm.sh failed — try unpkg mirror
+      try { await import('https://unpkg.com/barcode-detector/side-effects'); } catch(_) {}
+    }
+    window._barcodePolyfillReady = true;
+  </script>
   <style>
     :root {
       --green-dark: #1b5e20;
@@ -684,15 +697,14 @@ function goSetup() {
 }
 
 /* ── VOTE SYSTEM ─────────────────────────────────────── */
-// Collects raw reads into a rolling window. Only fires onConfirmedScan()
-// when the same value appears VOTE_NEEDED times out of VOTE_WINDOW frames,
-// which eliminates all one-off garbled / partial reads.
-const VOTE_WINDOW = 7;
-const VOTE_NEEDED = 5;
-const COOLDOWN_MS = 2200;
+// Require the same value 3× out of the last 5 raw frames before committing.
+// Eliminates single garbled reads without needing a near-perfect hit rate.
+const VOTE_WINDOW  = 5;
+const VOTE_NEEDED  = 3;
+const COOLDOWN_MS  = 2200;
 
-let voteBuffer = [];
-let lastConfirmed = '';
+let voteBuffer     = [];
+let lastConfirmed  = '';
 let lastConfirmedAt = 0;
 
 function castVote(raw) {
@@ -702,7 +714,6 @@ function castVote(raw) {
   voteBuffer.push(code);
   if (voteBuffer.length > VOTE_WINDOW) voteBuffer.shift();
 
-  // tally
   const counts = {};
   voteBuffer.forEach(c => counts[c] = (counts[c] || 0) + 1);
 
@@ -711,39 +722,30 @@ function castVote(raw) {
     if (v > maxVotes) { winner = k; maxVotes = v; }
   }
 
-  // progress UI
+  const bar = document.getElementById('lock-bar');
+  const lbl = document.getElementById('lock-label');
   const pct = Math.min(100, Math.round((maxVotes / VOTE_NEEDED) * 100));
-  const bar  = document.getElementById('lock-bar');
-  const lbl  = document.getElementById('lock-label');
-  bar.style.width = pct + '%';
+  if (bar) bar.style.width = pct + '%';
 
   if (maxVotes >= VOTE_NEEDED) {
-    bar.classList.add('locked');
-    lbl.textContent = 'Locked: ' + winner;
+    if (bar) bar.classList.add('locked');
+    if (lbl) lbl.textContent = 'Locked: ' + winner;
+
     const now = Date.now();
-    if (winner !== lastConfirmed || (now - lastConfirmedAt) > COOLDOWN_MS) {
-      lastConfirmed   = winner;
-      lastConfirmedAt = now;
-      voteBuffer = [];
-      // Brief flash before resetting bar
-      setTimeout(() => {
-        bar.style.width = '0%';
-        bar.classList.remove('locked');
-        lbl.textContent = 'Point camera at barcode';
-      }, 500);
-      addScan(winner);
-    } else {
-      // same code within cooldown — just reset bar
-      setTimeout(() => {
-        voteBuffer = [];
-        bar.style.width = '0%';
-        bar.classList.remove('locked');
-        lbl.textContent = 'Point camera at barcode';
-      }, 600);
-    }
+    const isNew = winner !== lastConfirmed || (now - lastConfirmedAt) > COOLDOWN_MS;
+    lastConfirmed   = winner;
+    lastConfirmedAt = now;
+    voteBuffer      = [];
+
+    setTimeout(() => {
+      if (bar) { bar.style.width = '0%'; bar.classList.remove('locked'); }
+      if (lbl) lbl.textContent = 'Point camera at barcode';
+    }, 500);
+
+    if (isNew) addScan(winner);
   } else {
-    bar.classList.remove('locked');
-    lbl.textContent = maxVotes > 0 ? `Locking… (${maxVotes}/${VOTE_NEEDED})` : 'Point camera at barcode';
+    if (bar) bar.classList.remove('locked');
+    if (lbl) lbl.textContent = maxVotes > 0 ? `Locking… (${maxVotes}/${VOTE_NEEDED})` : 'Point camera at barcode';
   }
 }
 
@@ -756,125 +758,101 @@ function resetVotes() {
 }
 
 /* ── SCANNER ─────────────────────────────────────────── */
-let activeStream   = null;   // MediaStream (native path)
-let rafId          = null;   // requestAnimationFrame handle
-let quaggaRunning  = false;
+let activeStream = null;
+let rafId        = null;
+let scanVideo    = null;
 
 async function startScanner() {
   resetVotes();
+
+  // Wait up to 6 s for the ES-module polyfill to patch BarcodeDetector
+  for (let i = 0; i < 60 && !window._barcodePolyfillReady && !('BarcodeDetector' in window); i++) {
+    await new Promise(r => setTimeout(r, 100));
+  }
+
+  if (!('BarcodeDetector' in window)) {
+    showToast('Barcode scanner unavailable – use manual entry', 'error');
+    document.getElementById('lock-label').textContent = 'Scanner unavailable – type barcodes above';
+    return;
+  }
+
+  // Build detector once – use all formats the engine supports
+  let detector;
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({
+    const supported = await BarcodeDetector.getSupportedFormats();
+    const want = ['code_128','code_39','ean_13','ean_8','upc_a','upc_e',
+                  'itf','pdf417','data_matrix','qr_code','aztec','codabar'];
+    const formats = want.filter(f => supported.includes(f));
+    detector = new BarcodeDetector({ formats: formats.length ? formats : undefined });
+  } catch(e) {
+    detector = new BarcodeDetector();
+  }
+
+  // Show which engine we're using
+  const isNative = !window._barcodePolyfillPatched;
+  document.getElementById('lock-label').textContent =
+    ('BarcodeDetector' in window && !window._forcePolyfill)
+      ? 'Point camera at barcode'
+      : 'Point camera at barcode';
+
+  // Open camera stream — keep constraints simple for maximum compatibility
+  try {
+    activeStream = await navigator.mediaDevices.getUserMedia({
       video: {
         facingMode: { ideal: 'environment' },
-        width:  { ideal: 1920 },
-        height: { ideal: 1080 },
-        advanced: [{ focusMode: 'continuous' }]
+        width:  { ideal: 1280 },
+        height: { ideal: 720 }
       }
     });
-    activeStream = stream;
-
-    if ('BarcodeDetector' in window) {
-      await _startNative(stream);
-    } else {
-      await _startQuagga(stream);
-    }
   } catch (err) {
-    if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-      showToast('Camera permission denied – use manual entry', 'error');
-    } else {
-      showToast('Camera unavailable – use manual entry', 'error');
-    }
+    const msg = (err.name === 'NotAllowedError')
+      ? 'Camera permission denied – use manual entry'
+      : 'Camera unavailable – use manual entry';
+    showToast(msg, 'error');
+    document.getElementById('lock-label').textContent = msg;
+    return;
   }
-}
 
-/* ── Native BarcodeDetector path ────────────────────── */
-async function _startNative(stream) {
-  const supported = await BarcodeDetector.getSupportedFormats().catch(() => []);
-  const want = ['code_128','code_39','ean_13','ean_8','upc_a','upc_e','itf','pdf417','data_matrix','qr_code','aztec'];
-  const formats = want.filter(f => supported.length === 0 || supported.includes(f));
-  const detector = new BarcodeDetector({ formats: formats.length ? formats : undefined });
-
+  // Create / reuse video element
   const reader = document.getElementById('reader');
   reader.innerHTML = '';
-  const video = document.createElement('video');
-  video.autoplay = true; video.playsInline = true; video.muted = true;
-  video.style.cssText = 'width:100%;height:100%;object-fit:cover;display:block;';
-  reader.appendChild(video);
-  video.srcObject = stream;
-  await video.play().catch(() => {});
+  scanVideo = document.createElement('video');
+  scanVideo.autoplay    = true;
+  scanVideo.playsInline = true;
+  scanVideo.muted       = true;
+  scanVideo.setAttribute('playsinline', '');     // iOS requirement
+  scanVideo.style.cssText = 'width:100%;height:100%;object-fit:cover;display:block;';
+  reader.appendChild(scanVideo);
+  scanVideo.srcObject = activeStream;
 
+  // Wait for video to have real frame data before detecting
+  await new Promise(resolve => {
+    if (scanVideo.readyState >= 2) { resolve(); return; }
+    scanVideo.addEventListener('canplay', resolve, { once: true });
+  });
+  await scanVideo.play().catch(() => {});
+
+  // Detection loop
   async function loop() {
-    if (!activeStream) return;
-    try {
-      const results = await detector.detect(video);
-      if (results.length > 0) castVote(results[0].rawValue);
-    } catch (_) {}
+    if (!activeStream || !scanVideo) return;
+    if (scanVideo.readyState >= 2 && scanVideo.videoWidth > 0) {
+      try {
+        const results = await detector.detect(scanVideo);
+        if (results.length > 0) castVote(results[0].rawValue);
+      } catch (_) {}
+    }
     rafId = requestAnimationFrame(loop);
   }
   rafId = requestAnimationFrame(loop);
 }
 
-/* ── Quagga2 fallback path ──────────────────────────── */
-async function _startQuagga(stream) {
-  // Stop the getUserMedia stream — Quagga manages its own
-  stream.getTracks().forEach(t => t.stop());
-  activeStream = null;
-
-  await _loadQuagga();
-
-  const reader = document.getElementById('reader');
-  reader.innerHTML = '';
-
-  await new Promise((resolve, reject) => {
-    Quagga.init({
-      inputStream: {
-        type: 'LiveStream',
-        target: reader,
-        constraints: {
-          facingMode: 'environment',
-          width:  { ideal: 1280 },
-          height: { ideal: 720 }
-        }
-      },
-      decoder: {
-        readers: [
-          'code_128_reader', 'code_39_reader',
-          'ean_reader', 'ean_8_reader',
-          'upc_reader', 'upc_e_reader', 'itf_reader'
-        ],
-        multiple: false
-      },
-      locate: true,
-      frequency: 12
-    }, err => err ? reject(err) : resolve());
-  });
-
-  Quagga.start();
-  quaggaRunning = true;
-
-  Quagga.onDetected(result => {
-    const code = result?.codeResult?.code;
-    if (code) castVote(code);
-  });
-}
-
-function _loadQuagga() {
-  if (window.Quagga) return Promise.resolve();
-  return new Promise((resolve, reject) => {
-    const s = document.createElement('script');
-    s.src = 'https://cdn.jsdelivr.net/npm/@ericblade/quagga2@1.8.4/dist/quagga.min.js';
-    s.onload = resolve;
-    s.onerror = reject;
-    document.head.appendChild(s);
-  });
-}
-
 function stopScanner() {
   if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
   if (activeStream) { activeStream.getTracks().forEach(t => t.stop()); activeStream = null; }
-  if (quaggaRunning) { try { Quagga.stop(); } catch(_) {} quaggaRunning = false; }
+  scanVideo = null;
   resetVotes();
-  document.getElementById('reader').innerHTML = '';
+  const reader = document.getElementById('reader');
+  if (reader) reader.innerHTML = '';
 }
 
 /* ── SCAN LOGIC ─────────────────────────────────────── */
