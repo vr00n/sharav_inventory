@@ -694,6 +694,7 @@ function addScan(barcode) {
   session.scans.unshift(entry);   // newest first
   updateScanCount();
   renderRecentItem(entry);
+  saveLocal();
 
   if (isDup) {
     showToast(`⚠ Duplicate: ${barcode}`, 'warn');
@@ -726,10 +727,12 @@ function renderRecentItem(entry) {
   div.className = `scan-item${entry.duplicate ? ' duplicate' : ''}`;
   div.dataset.id = entry.id;
 
-  const num = session.scans.length; // newest = first in array
   div.innerHTML = `
-    <div class="scan-num ${entry.duplicate ? 'dup' : ''}">${num}</div>
-    <div class="scan-code">${escHtml(entry.barcode)}</div>
+    <div class="scan-num ${entry.duplicate ? 'dup' : ''}">${entry.duplicate ? '⚠' : '✓'}</div>
+    <div style="flex:1">
+      <div class="scan-code">${escHtml(entry.barcode)}</div>
+      ${entry.duplicate ? '<div class="scan-meta" style="color:var(--warn)">Duplicate barcode</div>' : ''}
+    </div>
     <div class="scan-time">${entry.time}</div>
   `;
   list.prepend(div);
@@ -878,10 +881,6 @@ function loadLocal() {
     }
   } catch(e) {}
 }
-
-// Save on any scan change
-const origAddScan = addScan;
-window.addScan = function(b) { origAddScan(b); saveLocal(); };
 
 loadLocal();
 </script>
